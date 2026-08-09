@@ -1,96 +1,69 @@
-import cv2
-import numpy as np
-import requests
 import streamlit as st
+import cv2
+import requests
+import numpy as np
 
-# ضبط إعدادات الصفحة
-st.set_page_config(
-    page_title="كاشف الحركة - NodeMCU Wi-Fi", page_icon="📡", layout="wide"
-)
+st.title("Wireless Motion Control for NodeMCU")
 
-st.title("📡 التحكم اللاسلكي في NodeMCU عبر الواي فاي")
-st.write(
-    "التقط صورة للتحرك أمام الكاميرا؛ عند رصد الحركة سيتم إرسال أمر تشغيل للـ LED لاسلكياً لمدة 3 ثوانٍ."
-)
+# ضع عنوان IP الخاص بـ ESP8266 المطبوع في الـ Serial Monitor
+ESP_IP = st.text_input("NodeMCU IP Address:", "http://192.168.1.50")
 
-# -------------------------------------------------------------
-# 1. إعدادات عنوان الـ IP
-# -------------------------------------------------------------
-st.sidebar.header("🌐 إعدادات الشبكة")
-ip_address = st.sidebar.text_input(
-    "عنوان IP الخاصة بـ NodeMCU:",
-    value="192.168.1.50",
-    help="اكتب عنوان الـ IP الذي ظهر لك في Serial Monitor بعد رفع الكود",
-)
+# إعداد الكاميرا
+run = st.checkbox('Start Camera')
+FRAME_WINDOW = st.image([])
 
-enable_wifi = st.sidebar.checkbox("تفعيل التحكم اللاسلكي", value=True)
+camera = cv2.VideoCapture(0)
 
-# ذاكرة لحفظ الإطار السابق للكشف عن الحركة
+# تهيئة المتغيرات في session_state لمنع الأخطاء
 if "prev_frame" not in st.session_state:
     st.session_state.prev_frame = None
 
-# -------------------------------------------------------------
-# 2. واجهة المعالجة والتفاعل
-# -------------------------------------------------------------
-col1, col2 = st.columns([2, 1])
+def send_command(endpoint):
+    try:
+        url = f"{ESP_IP.strip('/')}/{endpoint}"
+        requests.get(url, timeout=0.5)
+    except Exception:
+        pass  # يتجاهل أخطاء الاتصال المؤقتة لضمان استمرار البث
 
-with col1:
-    img_file = st.camera_input("التقط صورة للكشف عن الحركة")
+while run:
+    ret, frame = camera.read()
+    if not ret:
+        st.error("Failed to capture image from camera.")
+        break
 
-if img_file is not None:
-    bytes_data = img_file.getvalue()
-    cv_img = cv2.imdecode(
-        np.frombuffer(bytes_data, np.uint8), cv2.IMREAD_COLOR
-    )
-
-    # معالجة الصورة لكشف الحركة
-    gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+    # تحويل الصورة للرمادي وتنعيمها لتقليل الضوضاء
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     gray_blur = cv2.GaussianBlur(gray, (21, 21), 0)
 
-    motion_detected = False
+    # 1. تهيئة prev_frame أول مرة أو إذا تغيرت الأبعاد
+    if st.session_state.prev_frame is None or st.session_state.prev_frame.shape != gray_blur.shape:
+        st.session_state.prev_frame = gray_blur
+        continue
 
-    if st.session_state.prev_frame is not None:
-        frame_delta = cv2.absdiff(st.session_state.prev_frame, gray_blur)
-        thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
-        thresh = cv2.dilate(thresh, None, iterations=2)
+    # 2. حساب الفرق المطلق بشكل آمن بين الإطار الحالي والسابق
+    frame_delta = cv2.absdiff(st.session_state.prev_frame, gray_blur)
+    thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
+    
+    # حساب نسبة التغير/الحركة في الصورة
+    motion_score = np.sum(thresh)
 
-        contours, _ = cv2.findContours(
-            thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
+    # عتبة كشف الحركة (يمكنك تعديل 50000 حسب الحساسية المطلوبة)
+    if motion_score > 50000:
+        cv2.putText(frame, "MOTION DETECTED - LED ON", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        send_command("on")
+    else:
+        cv2.putText(frame, "NO MOTION - LED OFF", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+        send_command("off")
 
-        for contour in contours:
-            if cv2.contourArea(contour) > 1500:  # حد حساسية الحركة
-                motion_detected = True
-                x, y, w, h = cv2.boundingRect(contour)
-                cv2.rectangle(cv_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
+    # تحديث الإطار السابق للعملية القادمة
     st.session_state.prev_frame = gray_blur
 
-    # -------------------------------------------------------------
-    # 3. إرسال أمر التشغيل اللاسلكي
-    # -------------------------------------------------------------
-    with col1:
-        st.image(
-            cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB),
-            caption="معاينة كشف الحركة",
-            use_container_width=True,
-        )
+    # عرض الفيديو في Streamlit (تحويل BGR إلى RGB)
+    FRAME_WINDOW.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
-    with col2:
-        st.subheader("📊 حالة الاستشعار والشبكة")
-
-        if motion_detected:
-            st.success("🚨 تم رصد حركة! جاري الإرسال عبر الواي فاي...")
-
-            if enable_wifi and ip_address:
-                try:
-                    # إرسال طلب HTTP إلى NodeMCU
-                    response = requests.get(
-                        f"http://{ip_address}/led/trigger", timeout=1.5
-                    )
-                    if response.status_code == 200:
-                        st.info("✅ تم استلام الأمر: الـ LED يعمل لمدة 3 ثوانٍ.")
-                except Exception as e:
-                    st.error(f"فشل الاتصال بـ NodeMCU: {e}")
-        else:
-            st.warning("⚪ لا توجد حركة جديدة.")
+else:
+    camera.release()
+    st.session_state.prev_frame = None
+    
